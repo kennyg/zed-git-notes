@@ -1,0 +1,8 @@
+[extension]
+id = "git-notes"
+name = "Git Notes"
+version = "0.0.1"
+schema_version = 1
+authors = ["kennyg"]
+description = "View git notes (including gh-annotate annotations) inline in the editor"
+repository = "https://github.com/kennyg/zed-git-notes"
