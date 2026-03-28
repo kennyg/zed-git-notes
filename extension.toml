@@ -6,3 +6,11 @@ schema_version = 1
 authors = ["kennyg"]
 description = "View git notes (including gh-annotate annotations) inline in the editor"
 repository = "https://github.com/kennyg/zed-git-notes"
+
+[slash_commands.git-notes]
+description = "Show git notes for the current file or a specific commit"
+requires_argument = false
+
+[language_servers.git-notes-lsp]
+name = "Git Notes LSP"
+languages = ["Markdown", "Plain Text", "Rust", "Python", "JavaScript", "TypeScript", "Go", "C", "C++", "Java", "Ruby", "Shell Script", "TOML", "YAML", "JSON"]
