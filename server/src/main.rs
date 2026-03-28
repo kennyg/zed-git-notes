@@ -26,7 +26,7 @@ impl GitNotesLsp {
         let mut notes = HashMap::new();
 
         let output = ProcessCommand::new("git")
-            .args(["-C", repo_root, "notes", "--list"])
+            .args(["-C", repo_root, "notes", "list"])
             .output();
 
         let output = match output {

@@ -76,7 +76,7 @@ impl GitNotesExtension {
     fn show_all_notes(&self, root: &str) -> Result<zed::SlashCommandOutput, String> {
         // List all notes refs
         let refs_output = zed::Command::new("git")
-            .args(["-C", root, "notes", "--list"])
+            .args(["-C", root, "notes", "list"])
             .output()
             .map_err(|e| format!("Failed to list notes: {e}"))?;
 
