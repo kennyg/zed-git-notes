@@ -1,4 +1,4 @@
 /target
 /server/target
-/mcp-server/target
 Cargo.lock
+extension.wasm
