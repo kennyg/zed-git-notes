@@ -1,4 +1,4 @@
 /target
 /server/target
-Cargo.lock
+/Cargo.lock
 extension.wasm
