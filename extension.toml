@@ -8,4 +8,13 @@ repository = "https://github.com/kennyg/zed-git-notes"
 
 [language_servers.git-notes-lsp]
 name = "Git Notes LSP"
-languages = ["Markdown", "Plain Text", "Rust", "Python", "JavaScript", "TypeScript", "Go", "C", "C++", "Java", "Ruby", "Shell Script", "TOML", "YAML", "JSON"]
+languages = [
+  "Astro", "Bash", "C", "C#", "C++", "Clojure", "CSS", "Dart",
+  "Dockerfile", "Elixir", "Elm", "Erlang", "GDScript", "Gleam", "Go",
+  "GraphQL", "Groovy", "Haskell", "HTML", "Java", "JavaScript", "JSON",
+  "Julia", "Kotlin", "Lua", "Makefile", "Markdown", "Nim", "OCaml",
+  "PHP", "Plain Text", "PowerShell", "Prisma", "Proto", "PureScript",
+  "Python", "R", "Racket", "Ruby", "Rust", "Scala", "SCSS", "Shell",
+  "SQL", "Svelte", "Swift", "Terraform", "TOML", "TypeScript", "YAML",
+  "XML", "Zig",
+]
