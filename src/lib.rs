@@ -70,6 +70,31 @@ impl zed::Extension for GitNotesExtension {
             env: worktree.shell_env(),
         })
     }
+
+    fn context_server_command(
+        &mut self,
+        context_server_id: &zed::ContextServerId,
+        _project: &zed::Project,
+    ) -> zed::Result<zed::Command> {
+        if context_server_id.as_ref() != "git-notes-mcp" {
+            return Err(format!("Unknown context server: {context_server_id}"));
+        }
+
+        // Look for the binary on PATH
+        let binary = zed::Command::new("which")
+            .arg("git-notes-mcp")
+            .output()
+            .ok()
+            .filter(|o| o.status == Some(0))
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .ok_or("git-notes-mcp binary not found on PATH. Install with: cargo install --path mcp-server")?;
+
+        Ok(zed::Command {
+            command: binary,
+            args: vec![],
+            env: vec![],
+        })
+    }
 }
 
 impl GitNotesExtension {

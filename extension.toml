@@ -13,3 +13,5 @@ requires_argument = false
 [language_servers.git-notes-lsp]
 name = "Git Notes LSP"
 languages = ["Markdown", "Plain Text", "Rust", "Python", "JavaScript", "TypeScript", "Go", "C", "C++", "Java", "Ruby", "Shell Script", "TOML", "YAML", "JSON"]
+
+[context_servers.git-notes-mcp]
