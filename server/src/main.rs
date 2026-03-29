@@ -10,6 +10,121 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 const NOTES_CACHE_TTL_SECS: u64 = 10;
 const BLAME_CACHE_TTL_SECS: u64 = 5;
 
+// --- Pure parsing functions (no I/O, easy to test) ---
+
+/// Parse `git notes list` output into (blob_sha, object_sha) pairs.
+fn parse_notes_list(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse `git cat-file --batch` output into a map of object_sha -> note content.
+/// `blob_to_object` maps each blob SHA to the object it annotates (from parse_notes_list).
+fn parse_cat_file_batch(output: &str, blob_to_object: &[(String, String)]) -> HashMap<String, String> {
+    let mut notes = HashMap::new();
+    let mut blob_idx = 0;
+    let mut remaining = output;
+
+    while !remaining.is_empty() && blob_idx < blob_to_object.len() {
+        // Find the header line: "<sha> <type> <size>"
+        let header_end = match remaining.find('\n') {
+            Some(pos) => pos,
+            None => break,
+        };
+        let header = &remaining[..header_end];
+        remaining = &remaining[header_end + 1..];
+
+        let header_parts: Vec<&str> = header.split_whitespace().collect();
+        if header_parts.len() < 3 {
+            break;
+        }
+        let size: usize = match header_parts[2].parse() {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+
+        // Read exactly <size> bytes of content
+        if remaining.len() < size {
+            break;
+        }
+        let content = remaining[..size].trim().to_string();
+        remaining = &remaining[size..];
+
+        // Skip trailing newline
+        if remaining.starts_with('\n') {
+            remaining = &remaining[1..];
+        }
+
+        if !content.is_empty() {
+            let object = &blob_to_object[blob_idx].1;
+            notes.insert(object.clone(), content);
+        }
+        blob_idx += 1;
+    }
+
+    notes
+}
+
+/// Parse `git blame --porcelain` output into a vec of commit SHAs, one per line.
+/// Index 0 = line 1 of the file, etc.
+fn parse_blame_porcelain(output: &str) -> Vec<String> {
+    let mut line_commits: Vec<String> = Vec::new();
+    let mut current_commit = String::new();
+
+    for line in output.lines() {
+        if line.len() >= 40
+            && line
+                .as_bytes()
+                .first()
+                .map_or(false, |b| b.is_ascii_hexdigit())
+        {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                current_commit = parts[0].to_string();
+            }
+        } else if line.starts_with('\t') {
+            line_commits.push(current_commit.clone());
+        }
+    }
+
+    line_commits
+}
+
+/// Cross-reference notes with blame to find which lines have notes.
+/// Returns one entry per unique commit (placed on the first line for that commit).
+fn match_notes_to_lines(
+    notes: &HashMap<String, String>,
+    line_commits: &[String],
+) -> Vec<(u32, LineNote)> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (line_idx, commit) in line_commits.iter().enumerate() {
+        if let Some(note) = notes.get(commit.as_str()) {
+            if seen.insert(commit.clone()) {
+                result.push((
+                    line_idx as u32,
+                    LineNote {
+                        commit: commit.clone(),
+                        note: note.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    result
+}
+
 struct GitNotesLsp {
     client: Client,
     notes_cache: RwLock<Option<(HashMap<String, String>, Instant)>>,
@@ -73,31 +188,24 @@ impl GitNotesLsp {
     }
 
     async fn fetch_all_notes(repo_root: &str) -> HashMap<String, String> {
-        let mut notes = HashMap::new();
-
         let list = match Self::git(repo_root, &["notes", "list"]).await {
             Some(l) if !l.is_empty() => l,
-            _ => return notes,
+            _ => return HashMap::new(),
         };
 
-        // Collect note blob SHAs and their annotated objects
-        let mut blob_to_object: Vec<(String, String)> = Vec::new();
-        for line in list.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                blob_to_object.push((parts[0].to_string(), parts[1].to_string()));
-            }
-        }
-
+        let blob_to_object = parse_notes_list(&list);
         if blob_to_object.is_empty() {
-            return notes;
+            return HashMap::new();
         }
 
         // Batch-read all note blobs with git cat-file --batch
-        let blob_shas: Vec<&str> = blob_to_object.iter().map(|(b, _)| b.as_str()).collect();
-        let input = blob_shas.join("\n");
+        let input = blob_to_object
+            .iter()
+            .map(|(b, _)| b.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        let output = Command::new("git")
+        let child = Command::new("git")
             .arg("-C")
             .arg(repo_root)
             .args(["cat-file", "--batch"])
@@ -106,12 +214,11 @@ impl GitNotesLsp {
             .stderr(std::process::Stdio::null())
             .spawn();
 
-        let mut child = match output {
+        let mut child = match child {
             Ok(c) => c,
-            Err(_) => return notes,
+            Err(_) => return HashMap::new(),
         };
 
-        // Write blob SHAs to stdin
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             let _ = stdin.write_all(input.as_bytes()).await;
@@ -121,54 +228,11 @@ impl GitNotesLsp {
 
         let output = match child.wait_with_output().await {
             Ok(o) if o.status.success() => o,
-            _ => return notes,
+            _ => return HashMap::new(),
         };
 
-        // Parse cat-file --batch output: each entry is:
-        // <sha> <type> <size>\n<content>\n
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut blob_idx = 0;
-        let mut chars = stdout.as_ref();
-
-        while !chars.is_empty() && blob_idx < blob_to_object.len() {
-            // Find the header line
-            let header_end = match chars.find('\n') {
-                Some(pos) => pos,
-                None => break,
-            };
-            let header = &chars[..header_end];
-            chars = &chars[header_end + 1..];
-
-            // Parse "<sha> blob <size>"
-            let header_parts: Vec<&str> = header.split_whitespace().collect();
-            if header_parts.len() < 3 {
-                break;
-            }
-            let size: usize = match header_parts[2].parse() {
-                Ok(s) => s,
-                Err(_) => break,
-            };
-
-            // Read exactly <size> bytes of content
-            if chars.len() < size {
-                break;
-            }
-            let content = chars[..size].trim().to_string();
-            chars = &chars[size..];
-
-            // Skip trailing newline
-            if chars.starts_with('\n') {
-                chars = &chars[1..];
-            }
-
-            if !content.is_empty() {
-                let object = &blob_to_object[blob_idx].1;
-                notes.insert(object.clone(), content);
-            }
-            blob_idx += 1;
-        }
-
-        notes
+        parse_cat_file_batch(&stdout, &blob_to_object)
     }
 
     /// Get blame for a file, cached with TTL.
@@ -197,32 +261,10 @@ impl GitNotesLsp {
     }
 
     async fn fetch_blame(repo_root: &str, file_path: &str) -> Vec<String> {
-        let blame_text = match Self::git(repo_root, &["blame", "--porcelain", "--", file_path]).await
-        {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
-
-        let mut line_commits: Vec<String> = Vec::new();
-        let mut current_commit = String::new();
-
-        for line in blame_text.lines() {
-            if line.len() >= 40
-                && line
-                    .as_bytes()
-                    .first()
-                    .map_or(false, |b| b.is_ascii_hexdigit())
-            {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    current_commit = parts[0].to_string();
-                }
-            } else if line.starts_with('\t') {
-                line_commits.push(current_commit.clone());
-            }
+        match Self::git(repo_root, &["blame", "--porcelain", "--", file_path]).await {
+            Some(text) => parse_blame_porcelain(&text),
+            None => Vec::new(),
         }
-
-        line_commits
     }
 
     /// Cross-reference notes with blame to find annotated lines.
@@ -233,28 +275,7 @@ impl GitNotesLsp {
             self.blame_file(repo_root, file_path),
         );
 
-        if all_notes.is_empty() {
-            return Vec::new();
-        }
-
-        let mut result = Vec::new();
-        let mut seen_commits = std::collections::HashSet::new();
-
-        for (line_idx, commit) in line_commits.iter().enumerate() {
-            if let Some(note) = all_notes.get(commit.as_str()) {
-                if seen_commits.insert(commit.clone()) {
-                    result.push((
-                        line_idx as u32,
-                        LineNote {
-                            commit: commit.clone(),
-                            note: note.clone(),
-                        },
-                    ));
-                }
-            }
-        }
-
-        result
+        match_notes_to_lines(&all_notes, &line_commits)
     }
 
     /// Look up the note for a specific line (any line, not just first-per-commit).
@@ -449,4 +470,288 @@ async fn main() {
 
     let (service, socket) = LspService::new(|client| GitNotesLsp::new(client));
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+// --- Tests ---
+//
+// In Rust, tests live inside a `#[cfg(test)]` module at the bottom of the file.
+// `#[cfg(test)]` means this code is ONLY compiled when running `cargo test`,
+// so it adds zero overhead to the production binary.
+//
+// Each test function is marked with `#[test]` (or `#[tokio::test]` for async).
+// Run them with: `cargo test`
+//
+// Tests can access private functions because they're in the same crate.
+// The `assert_eq!(actual, expected)` macro is the main way to check results.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Unit tests for pure parsing functions ----
+    // These are fast (no I/O) and test the parsing logic in isolation.
+
+    #[test]
+    fn test_parse_notes_list_basic() {
+        let output = "abc123def456 1111111111111111111111111111111111111111\n\
+                       fedcba987654 2222222222222222222222222222222222222222\n";
+
+        let result = parse_notes_list(output);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "abc123def456"); // blob sha
+        assert_eq!(result[0].1, "1111111111111111111111111111111111111111"); // object sha
+        assert_eq!(result[1].0, "fedcba987654");
+        assert_eq!(result[1].1, "2222222222222222222222222222222222222222");
+    }
+
+    #[test]
+    fn test_parse_notes_list_empty() {
+        assert!(parse_notes_list("").is_empty());
+        assert!(parse_notes_list("   \n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_notes_list_malformed_lines_skipped() {
+        // Lines with only one token should be skipped
+        let output = "only-one-token\n\
+                       abc123 def456\n";
+
+        let result = parse_notes_list(output);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "abc123");
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch() {
+        // Simulate git cat-file --batch output for two blobs
+        let blob_to_object = vec![
+            ("blob1".to_string(), "commit_aaa".to_string()),
+            ("blob2".to_string(), "commit_bbb".to_string()),
+        ];
+
+        // Format: "<sha> blob <size>\n<content>\n"
+        let output = "blob1 blob 13\nHello, world!\n\
+                       blob2 blob 8\nBug fix\n";
+
+        let notes = parse_cat_file_batch(output, &blob_to_object);
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes["commit_aaa"], "Hello, world!");
+        assert_eq!(notes["commit_bbb"], "Bug fix");
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_empty_content_skipped() {
+        let blob_to_object = vec![("blob1".to_string(), "commit_aaa".to_string())];
+
+        // A blob with only whitespace content
+        let output = "blob1 blob 3\n   \n";
+
+        let notes = parse_cat_file_batch(output, &blob_to_object);
+        assert!(notes.is_empty()); // trimmed to empty, should be skipped
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_multiline_content() {
+        let blob_to_object = vec![("blob1".to_string(), "commit_aaa".to_string())];
+
+        let content = "Line one\nLine two\nLine three";
+        let output = format!("blob1 blob {}\n{}\n", content.len(), content);
+
+        let notes = parse_cat_file_batch(&output, &blob_to_object);
+        assert_eq!(notes["commit_aaa"], content);
+    }
+
+    #[test]
+    fn test_parse_blame_porcelain() {
+        // This is what `git blame --porcelain` actually looks like.
+        // Each "group" starts with a 40-char SHA line, then metadata, then a \t-prefixed source line.
+        let output = "\
+aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111 1 1 3\n\
+author Alice\n\
+author-mail <alice@example.com>\n\
+summary First commit\n\
+filename app.py\n\
+\timport json\n\
+aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111 2 2\n\
+\timport sys\n\
+bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222 3 3 1\n\
+author Bob\n\
+author-mail <bob@example.com>\n\
+summary Second commit\n\
+filename app.py\n\
+\tprint('hello')\n";
+
+        let commits = parse_blame_porcelain(output);
+
+        // 3 source lines total
+        assert_eq!(commits.len(), 3);
+        // Lines 1-2 come from commit aaaa...
+        assert_eq!(commits[0], "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111");
+        assert_eq!(commits[1], "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111");
+        // Line 3 from commit bbbb...
+        assert_eq!(commits[2], "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222");
+    }
+
+    #[test]
+    fn test_parse_blame_porcelain_empty() {
+        assert!(parse_blame_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn test_match_notes_to_lines() {
+        let mut notes = HashMap::new();
+        notes.insert("commit_aaa".to_string(), "Note for A".to_string());
+        // commit_bbb has no note
+
+        let line_commits = vec![
+            "commit_aaa".to_string(), // line 0
+            "commit_aaa".to_string(), // line 1 (same commit, should be skipped)
+            "commit_bbb".to_string(), // line 2 (no note)
+            "commit_aaa".to_string(), // line 3 (already seen)
+        ];
+
+        let result = match_notes_to_lines(&notes, &line_commits);
+
+        // Should only return one entry: line 0 for commit_aaa
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0); // line number
+        assert_eq!(result[0].1.commit, "commit_aaa");
+        assert_eq!(result[0].1.note, "Note for A");
+    }
+
+    #[test]
+    fn test_match_notes_to_lines_multiple_commits_with_notes() {
+        let mut notes = HashMap::new();
+        notes.insert("commit_aaa".to_string(), "Note A".to_string());
+        notes.insert("commit_bbb".to_string(), "Note B".to_string());
+
+        let line_commits = vec![
+            "commit_aaa".to_string(), // line 0
+            "commit_bbb".to_string(), // line 1
+            "commit_aaa".to_string(), // line 2 (duplicate)
+        ];
+
+        let result = match_notes_to_lines(&notes, &line_commits);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[0].1.note, "Note A");
+        assert_eq!(result[1].0, 1);
+        assert_eq!(result[1].1.note, "Note B");
+    }
+
+    #[test]
+    fn test_match_notes_to_lines_no_notes() {
+        let notes = HashMap::new(); // empty
+        let line_commits = vec!["commit_aaa".to_string()];
+
+        let result = match_notes_to_lines(&notes, &line_commits);
+        assert!(result.is_empty());
+    }
+
+    // ---- Tests for LineNote ----
+
+    #[test]
+    fn test_short_sha() {
+        let note = LineNote {
+            commit: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+            note: "test".to_string(),
+        };
+        assert_eq!(note.short_sha(), "abcdef12");
+    }
+
+    #[test]
+    fn test_short_sha_short_commit() {
+        // Edge case: commit string shorter than 8 chars
+        let note = LineNote {
+            commit: "abc".to_string(),
+            note: "test".to_string(),
+        };
+        assert_eq!(note.short_sha(), "abc");
+    }
+
+    // ---- Tests for relative_path ----
+
+    #[test]
+    fn test_relative_path() {
+        let uri = Url::parse("file:///home/user/project/src/main.rs").unwrap();
+        let result = GitNotesLsp::relative_path(&uri, "/home/user/project");
+        assert_eq!(result.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn test_relative_path_root_file() {
+        let uri = Url::parse("file:///home/user/project/README.md").unwrap();
+        let result = GitNotesLsp::relative_path(&uri, "/home/user/project");
+        assert_eq!(result.as_deref(), Some("README.md"));
+    }
+
+    #[test]
+    fn test_relative_path_prefix_overlap_bug() {
+        // This was a bug with the old string-slicing approach:
+        // "/foo/bar" is a string prefix of "/foo/barmain.rs"
+        // Path::strip_prefix correctly rejects this since "barmain.rs" != "bar/main.rs"
+        let uri = Url::parse("file:///foo/barmain.rs").unwrap();
+        let result = GitNotesLsp::relative_path(&uri, "/foo/bar");
+        assert_eq!(result, None); // should NOT match
+    }
+
+    // ---- Integration test: full pipeline against a real git repo ----
+    // These tests create a temporary git repo, add commits and notes,
+    // then verify the LSP logic works end-to-end.
+
+    #[tokio::test]
+    async fn test_full_pipeline_with_real_git() {
+        // Create a temp directory for our test repo
+        let tmp_dir = std::env::temp_dir().join(format!("git-notes-test-{}", std::process::id()));
+        let tmp = tmp_dir.to_str().unwrap();
+
+        // Helper to run git commands in the test repo
+        async fn git(dir: &str, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .await
+                .expect("git command failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        // Set up: init repo, create a file, commit, add a note
+        std::fs::create_dir_all(tmp).unwrap();
+        git(tmp, &["init"]).await;
+        std::fs::write(tmp_dir.join("hello.txt"), "line one\nline two\n").unwrap();
+        git(tmp, &["add", "hello.txt"]).await;
+        git(tmp, &["commit", "-m", "initial"]).await;
+
+        let commit_sha = git(tmp, &["rev-parse", "HEAD"]).await;
+        git(tmp, &["notes", "add", "-m", "This is a test note", &commit_sha]).await;
+
+        // Test fetch_all_notes
+        let notes = GitNotesLsp::fetch_all_notes(tmp).await;
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[&commit_sha], "This is a test note");
+
+        // Test fetch_blame
+        let blame = GitNotesLsp::fetch_blame(tmp, "hello.txt").await;
+        assert_eq!(blame.len(), 2); // two lines in the file
+        assert_eq!(blame[0], commit_sha);
+        assert_eq!(blame[1], commit_sha);
+
+        // Test the full cross-reference
+        let matched = match_notes_to_lines(&notes, &blame);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, 0); // note on line 0 (first occurrence)
+        assert_eq!(matched[0].1.note, "This is a test note");
+
+        // Clean up
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 }
