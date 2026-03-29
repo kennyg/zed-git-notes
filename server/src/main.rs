@@ -9,6 +9,12 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 const NOTES_CACHE_TTL_SECS: u64 = 10;
 const BLAME_CACHE_TTL_SECS: u64 = 5;
+const BLAME_CACHE_MAX_ENTRIES: usize = 50;
+const MAX_NOTE_BLOB_SIZE: usize = 1_048_576; // 1 MB
+
+fn is_valid_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 // --- Pure parsing functions (no I/O, easy to test) ---
 
@@ -56,6 +62,15 @@ fn parse_cat_file_batch(output: &str, blob_to_object: &[(String, String)]) -> Ha
         if remaining.len() < size {
             break;
         }
+        // Skip oversized blobs to prevent memory exhaustion
+        if size > MAX_NOTE_BLOB_SIZE {
+            remaining = &remaining[size..];
+            if remaining.starts_with('\n') {
+                remaining = &remaining[1..];
+            }
+            blob_idx += 1;
+            continue;
+        }
         let content = remaining[..size].trim().to_string();
         remaining = &remaining[size..];
 
@@ -88,7 +103,7 @@ fn parse_blame_porcelain(output: &str) -> Vec<String> {
                 .map_or(false, |b| b.is_ascii_hexdigit())
         {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
+            if parts.len() >= 3 && is_valid_sha(parts[0]) {
                 current_commit = parts[0].to_string();
             }
         } else if line.starts_with('\t') {
@@ -251,9 +266,19 @@ impl GitNotesLsp {
 
         let commits = Self::fetch_blame(repo_root, file_path).await;
 
-        // Update cache
+        // Update cache, evicting oldest entries if over limit
         {
             let mut cache = self.blame_cache.write().await;
+            if cache.len() >= BLAME_CACHE_MAX_ENTRIES {
+                // Evict the oldest entry
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
             cache.insert(cache_key, (commits.clone(), Instant::now()));
         }
 
@@ -301,11 +326,8 @@ impl GitNotesLsp {
 
     fn repo_root_for_uri(uri: &Url) -> Option<String> {
         let path = uri.to_file_path().ok()?;
-        let dir = if path.is_file() {
-            path.parent()?.to_str()?.to_string()
-        } else {
-            path.to_str()?.to_string()
-        };
+        // Use parent directory lexically — don't stat the path (avoids TOCTOU)
+        let dir = path.parent()?.to_str()?.to_string();
 
         // This one stays sync — it's needed before we can do anything else,
         // and spawning a blocking task for a single fast git call isn't worth it.
@@ -416,6 +438,10 @@ impl LanguageServer for GitNotesLsp {
             Some(n) => n,
             None => return Ok(None),
         };
+
+        if !is_valid_sha(&note.commit) {
+            return Ok(None);
+        }
 
         let short = note.short_sha();
 
@@ -753,5 +779,63 @@ filename app.py\n\
 
         // Clean up
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    // ---- Security validation tests ----
+
+    #[test]
+    fn test_is_valid_sha() {
+        assert!(is_valid_sha("abcdef1234567890abcdef1234567890abcdef12"));
+        assert!(is_valid_sha("0000000000000000000000000000000000000000"));
+        assert!(is_valid_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn test_is_valid_sha_rejects_bad_input() {
+        // Too short
+        assert!(!is_valid_sha("abcdef12"));
+        // Too long
+        assert!(!is_valid_sha("abcdef1234567890abcdef1234567890abcdef12aa"));
+        // Non-hex characters
+        assert!(!is_valid_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+        // Uppercase is valid (git can output mixed case in some contexts)
+        assert!(is_valid_sha("ABCDEF1234567890ABCDEF1234567890ABCDEF12"));
+        // Git flag injection attempt
+        assert!(!is_valid_sha("--upload-pack=evil_command_here_padding"));
+        // Empty
+        assert!(!is_valid_sha(""));
+    }
+
+    #[test]
+    fn test_blame_parser_rejects_invalid_sha() {
+        // A line that starts with hex but isn't a valid 40-char SHA should be skipped
+        let output = "\
+--upload-pack=evil 1 1 1\n\
+\tline content\n";
+
+        let commits = parse_blame_porcelain(output);
+        // Should produce a line entry but with empty commit (no valid SHA parsed)
+        assert!(commits.is_empty() || commits.iter().all(|c| c.is_empty() || is_valid_sha(c)));
+    }
+
+    #[test]
+    fn test_cat_file_batch_skips_oversized_blob() {
+        let blob_to_object = vec![
+            ("blob1".to_string(), "commit_aaa".to_string()),
+            ("blob2".to_string(), "commit_bbb".to_string()),
+        ];
+
+        // First blob exceeds MAX_NOTE_BLOB_SIZE, second is normal
+        let big_size = MAX_NOTE_BLOB_SIZE + 100;
+        let big_content = "x".repeat(big_size);
+        let output = format!(
+            "blob1 blob {big_size}\n{big_content}\nblob2 blob 4\ntest\n"
+        );
+
+        let notes = parse_cat_file_batch(&output, &blob_to_object);
+
+        // Oversized blob should be skipped, normal one included
+        assert!(!notes.contains_key("commit_aaa"));
+        assert_eq!(notes.get("commit_bbb").map(|s| s.as_str()), Some("test"));
     }
 }

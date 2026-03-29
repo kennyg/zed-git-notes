@@ -5,9 +5,6 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   build:
     strategy:
@@ -23,12 +20,14 @@ jobs:
             os: ubuntu-latest
 
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20b6f6d7b4d97e0b4e0a # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -40,7 +39,7 @@ jobs:
 
       - name: Build
         working-directory: server
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
@@ -51,7 +50,7 @@ jobs:
           mv git-notes-lsp-${{ matrix.target }}.tar.gz ${{ github.workspace }}/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: git-notes-lsp-${{ matrix.target }}
           path: git-notes-lsp-${{ matrix.target }}.tar.gz
@@ -59,14 +58,16 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8e5e8bb495b4d6 # v2.2.1
         with:
           files: "*.tar.gz"
           generate_release_notes: true
